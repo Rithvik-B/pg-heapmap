@@ -110,5 +110,18 @@ CREATE FUNCTION heapmap_window(
     OUT tail_pages bigint
 ) AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The model itself, one row per segment. The last one is still open.
+CREATE FUNCTION heapmap_segments(
+    index regclass,
+    OUT segment int,
+    OUT start_key bigint,           -- the segment answers for keys from here up to the next start
+    OUT pages_per_key float8,       -- slope of its line
+    OUT page_at_start float8,       -- heap page its line gives for start_key
+    OUT window_from int,            -- a row is at most this far before its predicted page ...
+    OUT window_to int,              -- ... and at most this far after
+    OUT is_open boolean
+) RETURNS SETOF record AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 REVOKE ALL ON FUNCTION heapmap_stats(regclass) FROM PUBLIC;
+REVOKE ALL ON FUNCTION heapmap_segments(regclass) FROM PUBLIC;
 REVOKE ALL ON FUNCTION heapmap_window(regclass, bigint) FROM PUBLIC;

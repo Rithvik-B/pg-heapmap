@@ -108,7 +108,7 @@ hm_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	BlockNumber first;
 	BlockNumber last;
 	HmStateData state;
-	HmCache    *cache;
+	HmModel		model;
 	int64		pages = 0;
 	int64		exact;
 
@@ -118,19 +118,19 @@ hm_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	if (so->empty)
 		return 0;
 
-	// Open the table before touching the segment cache: taking the lock can
-	// process invalidations, which may free the cache.
+	// Open the table before touching the model: taking the lock can process
+	// invalidations, which may free the cached segments.
 	heap = table_open(IndexGetRelation(RelationGetRelid(index), false), AccessShareLock);
 	nblocks = RelationGetNumberOfBlocks(heap);
 	table_close(heap, AccessShareLock);
 
 	hm_read_state(index, &state);
-	cache = hm_sync_cache(index, &state);
+	hm_get_model(index, &state, &model);
 
 	// Rows the model covers: only below the frontier.
 	limit = Min(state.frontier, nblocks);
 	if (limit > 0 &&
-		hm_range_window(cache->segs, state.nsegments, so->lo, so->hi, &first, &last) &&
+		hm_range_window(&model, so->lo, so->hi, &first, &last) &&
 		first < limit)
 	{
 		last = Min(last, limit - 1);

@@ -37,7 +37,7 @@ build_callback(Relation index, ItemPointer tid, Datum *values, bool *isnull,
 }
 
 static void
-init_state(Relation index, HmStateData *state)
+init_state(Relation index, const HmOptions *opts, HmStateData *state)
 {
 	memset(state, 0, sizeof(HmStateData));
 	state->magic = HM_MAGIC;
@@ -46,15 +46,20 @@ init_state(Relation index, HmStateData *state)
 	state->attnum = index->rd_index->indkey.values[0];
 	state->nsegments = 0;
 	state->last_model_blk = HM_FIRST_MODEL_BLKNO;
+	state->has_open = false;
 	state->has_covered = false;
 	state->max_covered_key = PG_INT64_MIN;
 	state->frontier = 0;
 	state->frontier_key = PG_INT64_MIN;	// an empty index: every row is in the tail
+	state->fold_step = (uint32) Max(1, opts->fold_after - opts->keep);
+	state->rows_folded = 0.0;
+	state->stall_mark = 0.0;
+	state->nstalls = 0;
 }
 
-// Append segments to the model and publish newstate. The caller holds the state
-// page exclusively and has filled in every field of newstate except the segment
-// count and last model page, which are advanced here.
+// Append sealed segments to the model and publish newstate. The caller holds the
+// state page exclusively and has filled in every field of newstate except the
+// sealed segment count and last model page, which are advanced here.
 //
 // Segments go in before the state that counts them. After a crash in between,
 // the state still has the old count, readers ignore what lies beyond it, and the
@@ -161,9 +166,11 @@ hm_buildempty(Relation index)
 {
 	BulkWriteState *bulk = smgr_bulk_start_rel(index, INIT_FORKNUM);
 	HmStateData state;
+	HmOptions	opts;
 	static const uint16 flags[] = {HM_F_STATE, HM_F_EXC_LEAF, HM_F_MODEL};
 
-	init_state(index, &state);
+	hm_get_options(index, &opts);
+	init_state(index, &opts, &state);
 	for (int i = 0; i < 3; i++)
 	{
 		BulkWriteBuffer buf = smgr_bulk_get_buf(bulk);
@@ -208,7 +215,7 @@ hm_build(Relation heap, Relation index, IndexInfo *indexInfo)
 				 errmsg("heapmap indexes cannot be built on an expression")));
 
 	hm_get_options(index, &opts);
-	init_state(index, &state);
+	init_state(index, &opts, &state);
 
 	bs.keytype = state.keytype;
 	bs.cap = Max(1024, (int64) heap->rd_rel->reltuples + 1);
@@ -225,7 +232,11 @@ hm_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (!sorted)
 		qsort(bs.tuples, bs.n, sizeof(HmTuple), hm_tuple_cmp_phys);
 
-	// The last few pages are still being filled, so they start out as the tail.
+	// The last few pages with rows are still being filled, so they start out as
+	// the tail. So do the empty pages a bulk load leaves after them: PostgreSQL
+	// fills those later, with whatever keys are arriving then.
+	if (bs.n > 0)
+		nblocks = bs.tuples[bs.n - 1].blk + 1;
 	frontier = nblocks > (BlockNumber) opts.keep ? nblocks - opts.keep : 0;
 	nmodel = 0;
 	while (nmodel < bs.n && bs.tuples[nmodel].blk < frontier)
@@ -245,16 +256,40 @@ hm_build(Relation heap, Relation index, IndexInfo *indexInfo)
 				state.max_covered_key = bs.tuples[i].key;
 			state.has_covered = true;
 		}
+
+		// The newest segment stays open, in the state page.
+		if (nsegs > 0)
+		{
+			state.has_open = true;
+			state.open = segs[--nsegs];
+			state.open_rows = 0.0;
+			for (int64 i = nmodel - 1; i >= 0; i--)
+			{
+				// an only segment also owns the keys below its start
+				if (nsegs > 0 && bs.tuples[i].key < state.open.start_key)
+					break;
+				if (!bs.tuples[i].exception)
+					state.open_rows += 1.0;
+			}
+		}
 	}
 
-	// The tail's lower fence. Tail rows below it are exceptions.
+	// The tail's lower fence: its smallest key, unless that key is a stray far
+	// below the rest, in which case the fence goes at the 5th percentile and the
+	// tail rows below it become exceptions.
 	if (ntail > 0)
 	{
 		int64	   *keys = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(int64) * ntail);
+		int64		low;
+		int64		high;
 
 		for (int64 i = 0; i < ntail; i++)
 			keys[i] = bs.tuples[nmodel + i].key;
-		state.frontier_key = hm_choose_fence(keys, ntail);
+		low = hm_choose_fence(keys, ntail);	// sorts keys
+		high = keys[ntail - 1 - ntail / 20];
+		if ((uint64) low - (uint64) keys[0] <= (uint64) high - (uint64) low)
+			low = keys[0];
+		state.frontier_key = low;
 		pfree(keys);
 		for (int64 i = nmodel; i < bs.n; i++)
 			bs.tuples[i].exception = bs.tuples[i].key < state.frontier_key;

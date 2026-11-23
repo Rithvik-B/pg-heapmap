@@ -19,6 +19,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(heapmap_handler);
 PG_FUNCTION_INFO_V1(heapmap_stats);
 PG_FUNCTION_INFO_V1(heapmap_window);
+PG_FUNCTION_INFO_V1(heapmap_segments);
 
 static relopt_kind hm_relopt_kind;
 
@@ -39,10 +40,13 @@ _PG_init(void)
 					   HM_DEFAULT_EXCEPTION_PCT, 0.0, 100.0, AccessExclusiveLock);
 	add_int_reloption(hm_relopt_kind, "fold_after",
 					  "Number of new heap pages after which they are added to the model",
-					  HM_DEFAULT_FOLD_AFTER, 2, HM_MAX_FOLD_BLOCKS, ShareUpdateExclusiveLock);
+					  HM_DEFAULT_FOLD_AFTER, 2, 512, ShareUpdateExclusiveLock);
 	add_int_reloption(hm_relopt_kind, "keep",
-					  "Heap pages at the end of the table left out of the model, as they are still filling",
+					  "Heap pages at the end of the table always left out of the model",
 					  HM_DEFAULT_KEEP, 1, 256, ShareUpdateExclusiveLock);
+	add_int_reloption(hm_relopt_kind, "max_tail",
+					  "Heap pages that may wait outside the model for their writers to finish with them",
+					  HM_DEFAULT_MAX_TAIL, 16, 8192, ShareUpdateExclusiveLock);
 }
 
 bytea *
@@ -54,6 +58,7 @@ hm_options(Datum reloptions, bool validate)
 		{"exception_pct", RELOPT_TYPE_REAL, offsetof(HmOptions, exception_pct)},
 		{"fold_after", RELOPT_TYPE_INT, offsetof(HmOptions, fold_after)},
 		{"keep", RELOPT_TYPE_INT, offsetof(HmOptions, keep)},
+		{"max_tail", RELOPT_TYPE_INT, offsetof(HmOptions, max_tail)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, hm_relopt_kind,
@@ -74,6 +79,7 @@ hm_get_options(Relation index, HmOptions *out)
 		out->exception_pct = HM_DEFAULT_EXCEPTION_PCT;
 		out->fold_after = HM_DEFAULT_FOLD_AFTER;
 		out->keep = HM_DEFAULT_KEEP;
+		out->max_tail = HM_DEFAULT_MAX_TAIL;
 	}
 }
 
@@ -121,9 +127,13 @@ hm_read_state(Relation index, HmStateData *state)
 {
 	Buffer		buf = ReadBuffer(index, HM_STATE_BLKNO);
 
+	// the fields past HM_STATE_READ_SIZE are a fold's working notes
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	memcpy(state, HmState(BufferGetPage(buf)), sizeof(HmStateData));
+	memcpy(state, HmState(BufferGetPage(buf)), HM_STATE_READ_SIZE);
 	UnlockReleaseBuffer(buf);
+	state->rows_folded = 0.0;
+	state->stall_mark = 0.0;
+	state->nstalls = 0;
 
 	if (state->magic != HM_MAGIC || state->version != HM_VERSION)
 		ereport(ERROR,
@@ -132,11 +142,11 @@ hm_read_state(Relation index, HmStateData *state)
 						RelationGetRelationName(index))));
 }
 
-// Returns this backend's copy of the segments, holding at least the
-// state->nsegments that state describes. The first state->nsegments segments
-// never change once state has been published, so this needs no lock on the
-// state page. The pointer is only good until the next relcache invalidation, so
-// callers use it straight away and do not keep it across catalog access.
+// Returns this backend's copy of the sealed segments, holding at least the
+// state->nsegments that state describes. Those never change once state has been
+// published, so this needs no lock on the state page. The pointer is only good
+// until the next relcache invalidation, so callers use it straight away and do
+// not keep it across catalog access.
 HmCache *
 hm_sync_cache(Relation index, const HmStateData *state)
 {
@@ -196,6 +206,17 @@ hm_sync_cache(Relation index, const HmStateData *state)
 	}
 
 	return cache;
+}
+
+// The whole model as state describes it. The open segment is read from the
+// caller's copy of the state, which must outlive the model.
+void
+hm_get_model(Relation index, const HmStateData *state, HmModel *model)
+{
+	model->sealed = hm_sync_cache(index, state)->segs;
+	model->nsealed = state->nsegments;
+	model->open = state->has_open ? &state->open : NULL;
+	model->n = hm_nsegs(state);
 }
 
 // The index has no entries for covered rows, so a lookup costs almost nothing in
@@ -314,7 +335,7 @@ heapmap_stats(PG_FUNCTION_ARGS)
 	BlockNumber heap_pages = heap_blocks_of(index);
 	TupleDesc	tupdesc;
 	HmStateData state;
-	HmCache    *cache;
+	HmModel		model;
 	BlockNumber nblocks;
 	int64		exc_entries = 0,
 				exc_pages = 0,
@@ -330,10 +351,10 @@ heapmap_stats(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	hm_read_state(index, &state);
-	cache = hm_sync_cache(index, &state);
-	for (uint32 s = 0; s < state.nsegments; s++)
+	hm_get_model(index, &state, &model);
+	for (uint32 s = 0; s < model.n; s++)
 	{
-		int64		w = (int64) cache->segs[s].max_err - cache->segs[s].min_err + 1;
+		int64		w = (int64) hm_seg(&model, s)->max_err - hm_seg(&model, s)->min_err + 1;
 
 		if (w <= 0)
 			continue;
@@ -366,7 +387,7 @@ heapmap_stats(PG_FUNCTION_ARGS)
 		UnlockReleaseBuffer(buf);
 	}
 
-	values[0] = Int64GetDatum((int64) state.nsegments);
+	values[0] = Int64GetDatum((int64) model.n);
 	values[1] = Float8GetDatum(live_segments ? window_sum / (double) live_segments : 0.0);
 	values[2] = Int64GetDatum(window_max);
 	values[3] = Int64GetDatum((int64) heap_pages);
@@ -397,7 +418,7 @@ heapmap_window(PG_FUNCTION_ARGS)
 	BlockNumber heap_pages = heap_blocks_of(index);
 	TupleDesc	tupdesc;
 	HmStateData state;
-	HmCache    *cache;
+	HmModel		model;
 	BlockNumber first,
 				last;
 	BlockNumber limit;
@@ -408,10 +429,10 @@ heapmap_window(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	hm_read_state(index, &state);
-	cache = hm_sync_cache(index, &state);
+	hm_get_model(index, &state, &model);
 	limit = Min(state.frontier, heap_pages);
 
-	if (limit > 0 && hm_range_window(cache->segs, state.nsegments, key, key, &first, &last) &&
+	if (limit > 0 && hm_range_window(&model, key, key, &first, &last) &&
 		first < limit)
 	{
 		values[0] = Int64GetDatum((int64) first);
@@ -425,4 +446,39 @@ heapmap_window(PG_FUNCTION_ARGS)
 
 	relation_close(index, AccessShareLock);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+// heapmap_segments(index): the model, one row per segment.
+Datum
+heapmap_segments(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	index;
+	HmStateData state;
+	HmModel		model;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	index = open_heapmap(PG_GETARG_OID(0));
+	hm_read_state(index, &state);
+	hm_get_model(index, &state, &model);
+	for (uint32 s = 0; s < model.n; s++)
+	{
+		const HmSegment *seg = hm_seg(&model, s);
+		bool		empty = seg->min_err > seg->max_err;
+		Datum		values[7];
+		bool		nulls[7] = {0};
+
+		values[0] = Int32GetDatum((int32) s + 1);
+		values[1] = Int64GetDatum(seg->start_key);
+		values[2] = Float8GetDatum(seg->slope);
+		values[3] = Float8GetDatum(seg->intercept);
+		values[4] = Int32GetDatum(seg->min_err);
+		values[5] = Int32GetDatum(seg->max_err);
+		nulls[4] = nulls[5] = empty;	// a segment that covers no rows
+		values[6] = BoolGetDatum(s >= model.nsealed);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	relation_close(index, AccessShareLock);
+	return (Datum) 0;
 }

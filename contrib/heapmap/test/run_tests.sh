@@ -2,6 +2,8 @@
 # Correctness suite for the heapmap index. Every check compares the rows the
 # index returns with a sequential scan. Stops at the first failure.
 #   test/run_tests.sh [rows] [rounds]
+# The one-line summaries in between are for reading, not checked: they show how
+# much of each table the model describes.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +18,7 @@ Q -f "$HERE/checks.sql"
 echo "== build and read"
 Q <<SQL
 DROP TABLE IF EXISTS t_sorted, t_jitter, t_late, t_batch, t_dup, t_random, t_neg, t_null,
-                     t_empty, t_one, t_same, t_ts, t_int4, t_date, t_wide;
+                     t_empty, t_one, t_same, t_ts, t_int4, t_date, t_wide, t_var;
 -- rows in key order, like a log
 CREATE TABLE t_sorted AS SELECT i::bigint AS k FROM generate_series(1, $ROWS) i;
 -- each row up to 2000 positions (about 9 pages) away from its place
@@ -43,6 +45,8 @@ CREATE TABLE t_date AS SELECT date '2000-01-01' + (i / 300) AS k FROM generate_s
 -- a second column, so updates that leave the key alone can stay on the page
 CREATE TABLE t_wide AS SELECT i::bigint AS k, 0 AS v, repeat('x', 40) AS pad FROM generate_series(1, $ROWS) i;
 ALTER TABLE t_wide SET (fillfactor = 70);
+-- rows of very different lengths, so pages are left with room a shorter row fits in later
+CREATE TABLE t_var AS SELECT i::bigint AS k, repeat('x', (random() * 300)::int) AS pad FROM generate_series(1, $ROWS) i;
 
 CREATE INDEX i_sorted ON t_sorted USING heapmap (k);
 CREATE INDEX i_jitter ON t_jitter USING heapmap (k);
@@ -59,11 +63,12 @@ CREATE INDEX i_ts ON t_ts USING heapmap (k);
 CREATE INDEX i_int4 ON t_int4 USING heapmap (k);
 CREATE INDEX i_date ON t_date USING heapmap (k);
 CREATE INDEX i_wide ON t_wide USING heapmap (k);
+CREATE INDEX i_var ON t_var USING heapmap (k);
 ANALYZE;
 SQL
 
-TABLES="t_sorted t_jitter t_late t_batch t_dup t_random t_neg t_null t_empty t_one t_same t_ts t_int4 t_date t_wide"
-INDEXES="i_sorted i_jitter i_late i_batch i_dup i_random i_neg i_null i_empty i_one i_same i_ts i_int4 i_date i_wide"
+TABLES="t_sorted t_jitter t_late t_batch t_dup t_random t_neg t_null t_empty t_one t_same t_ts t_int4 t_date t_wide t_var"
+INDEXES="i_sorted i_jitter i_late i_batch i_dup i_random i_neg i_null i_empty i_one i_same i_ts i_int4 i_date i_wide i_var"
 check_all() { for t in $TABLES; do Q -c "SELECT hm_check('$t', $ROUNDS)"; done; }
 summary() { for i in "$@"; do Q -c "SELECT hm_summary('$i')"; done; }
 check_all
@@ -84,15 +89,17 @@ INSERT INTO t_random SELECT (random() * 9e18)::bigint FROM generate_series(1, $R
 INSERT INTO t_ts SELECT timestamptz '2026-01-01 00:00:00+00' + ($ROWS + i) * interval '1.5 second' FROM generate_series(1, $ROWS / 2) i;
 INSERT INTO t_neg VALUES (9223372036854775807), (-9223372036854775808), (NULL);
 INSERT INTO t_null SELECT CASE WHEN i % 2 = 0 THEN NULL ELSE ($ROWS + i)::bigint END FROM generate_series(1, $ROWS / 2) i;
+INSERT INTO t_var SELECT ($ROWS + i)::bigint, repeat('x', (random() * 300)::int) FROM generate_series(1, $ROWS) i;
 ANALYZE;
 SQL
 check_all
-summary i_sorted i_jitter i_empty i_one i_same i_dup i_random i_ts
+summary i_sorted i_jitter i_empty i_one i_same i_dup i_random i_ts i_var
 
 echo "== one row at a time, as an application would insert"
 Q -c "DO \$\$ BEGIN FOR i IN 1..30000 LOOP INSERT INTO t_one VALUES (100000 + i); END LOOP; END \$\$" -c "ANALYZE t_one"
-Q -c "SELECT hm_check('t_one', $ROUNDS)"
-summary i_one
+Q -c "DO \$\$ BEGIN FOR i IN 1..30000 LOOP INSERT INTO t_var VALUES ($ROWS * 2 + i, repeat('x', (random() * 300)::int)); END LOOP; END \$\$" -c "ANALYZE t_var"
+Q -c "SELECT hm_check('t_one', $ROUNDS)" -c "SELECT hm_check('t_var', $ROUNDS)"
+summary i_one i_var
 
 echo "== updates that move rows, updates that do not, deletes, vacuum, reuse of freed space"
 Q <<SQL

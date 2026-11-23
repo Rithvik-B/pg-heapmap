@@ -4,7 +4,9 @@
 // neighbours (late arrivals, backfills, bad timestamps). It works in three steps:
 //
 //   1. Summarise each heap page by its median key. A few stray rows on a page
-//      do not move the median.
+//      do not move the median. Pages with only a few rows are left out: a page
+//      that has just been started says little, and if its first row is a stray
+//      one, it says something wrong.
 //   2. Keep the longest run of pages whose medians never decrease. Pages that
 //      are entirely out of place (a batch loaded late) drop out here.
 //   3. Fit straight segments through (median key, page number) so that no kept
@@ -43,22 +45,28 @@ hm_predict(const HmSegment *seg, int64 key)
 
 // The segment responsible for key: the last one starting at or below it. Keys
 // below every segment use the first.
-int
-hm_find_segment(const HmSegment *segs, uint32 nsegs, int64 key)
+uint32
+hm_find_segment(const HmModel *m, int64 key)
 {
 	uint32		lo = 0;
-	uint32		hi = nsegs;
+	uint32		hi = m->n;
 
 	while (lo < hi)
 	{
 		uint32		mid = lo + (hi - lo) / 2;
 
-		if (segs[mid].start_key <= key)
+		if (hm_seg(m, mid)->start_key <= key)
 			lo = mid + 1;
 		else
 			hi = mid;
 	}
-	return lo == 0 ? 0 : (int) (lo - 1);
+	return lo == 0 ? 0 : lo - 1;
+}
+
+int
+hm_window_width(int32 min_err, int32 max_err)
+{
+	return max_err >= min_err ? max_err - min_err + 1 : 0;
 }
 
 // Pages a covered row with this key can be on. False if there are none.
@@ -89,35 +97,36 @@ hm_window(const HmSegment *seg, int64 key, BlockNumber *lo, BlockNumber *hi)
 // Pages a covered row with any key in [lo, hi] can be on. Within a segment the
 // prediction never decreases, so its two ends bound everything in between.
 bool
-hm_range_window(const HmSegment *segs, uint32 nsegs, int64 lo, int64 hi,
+hm_range_window(const HmModel *m, int64 lo, int64 hi,
 				BlockNumber *first, BlockNumber *last)
 {
-	int			a;
-	int			b;
+	uint32		a;
+	uint32		b;
 	bool		found = false;
 
-	if (nsegs == 0 || lo > hi)
+	if (m->n == 0 || lo > hi)
 		return false;
 
-	a = hm_find_segment(segs, nsegs, lo);
-	b = hm_find_segment(segs, nsegs, hi);
+	a = hm_find_segment(m, lo);
+	b = hm_find_segment(m, hi);
 
-	for (int s = a; s <= b; s++)
+	for (uint32 s = a; s <= b; s++)
 	{
-		int64		klo = (s == a) ? lo : segs[s].start_key;
-		int64		khi = (s == b) ? hi : segs[s + 1].start_key - 1;
+		const HmSegment *seg = hm_seg(m, s);
+		int64		klo = (s == a) ? lo : seg->start_key;
+		int64		khi = (s == b) ? hi : hm_seg(m, s + 1)->start_key - 1;
 		BlockNumber wlo,
 					whi,
 					unused;
 
-		if (!hm_window(&segs[s], klo, &wlo, &unused))
+		if (!hm_window(seg, klo, &wlo, &unused))
 		{
 			// the low end falls off the front; the high end may still be valid
-			if (segs[s].min_err > segs[s].max_err)
+			if (seg->min_err > seg->max_err)
 				continue;
 			wlo = 0;
 		}
-		if (!hm_window(&segs[s], khi, &unused, &whi))
+		if (!hm_window(seg, khi, &unused, &whi))
 			continue;
 
 		if (!found)
@@ -172,15 +181,14 @@ int64_cmp(const void *a, const void *b)
 	return x < y ? -1 : (x > y ? 1 : 0);
 }
 
-// Lower fence for the tail: a key near the bottom of the keys given, low enough
-// that rows arriving slightly late still count as in order, but not dragged down
-// by a single stray row. Sorts the array.
+// The 5th percentile of the keys given: a key near the bottom, but not dragged
+// down by a few stray rows. Sorts the array.
 int64
 hm_choose_fence(int64 *keys, int64 n)
 {
 	Assert(n > 0);
 	qsort(keys, n, sizeof(int64), int64_cmp);
-	return keys[n / 20];		// 5th percentile
+	return keys[n / 20];
 }
 
 typedef struct Knot
@@ -198,6 +206,9 @@ make_knots(const HmTuple *tuples, int64 n, Knot **out)
 	int64		cap = 1024;
 	int64	   *med = palloc(sizeof(int64) * cap);
 	BlockNumber *blk = palloc(sizeof(BlockNumber) * cap);
+	int		   *rows = palloc(sizeof(int) * cap);
+	int			most = 0;
+	int64		kept = 0;
 	int64		buf[MaxHeapTuplesPerPage + 8];
 	int64	   *tails;
 	int64	   *prev;
@@ -224,12 +235,27 @@ make_knots(const HmTuple *tuples, int64 n, Knot **out)
 			cap *= 2;
 			med = repalloc_huge(med, sizeof(int64) * cap);
 			blk = repalloc_huge(blk, sizeof(BlockNumber) * cap);
+			rows = repalloc_huge(rows, sizeof(int) * cap);
 		}
 		med[npages] = buf[(cnt - 1) / 2];
 		blk[npages] = tuples[i].blk;
+		rows[npages] = cnt;
+		most = Max(most, cnt);
 		npages++;
 		i = j;
 	}
+
+	// drop the pages holding less than a quarter of what the fullest holds
+	for (int64 p = 0; p < npages; p++)
+	{
+		if (rows[p] * 4 < most)
+			continue;
+		med[kept] = med[p];
+		blk[kept] = blk[p];
+		kept++;
+	}
+	npages = kept;
+	pfree(rows);
 
 	if (npages == 0)
 	{
@@ -278,6 +304,7 @@ make_knots(const HmTuple *tuples, int64 n, Knot **out)
 	return len;
 }
 
+// slope may be NAN for "not known yet"; fit_knots fills those in at the end
 static void
 emit_segment(HmSegment **segs, int *nsegs, int *cap, int64 start, double slope, double intercept)
 {
@@ -300,12 +327,20 @@ emit_segment(HmSegment **segs, int *nsegs, int *cap, int64 start, double slope, 
 // Greedy "shrinking cone": keep the range of slopes that still pass within eps
 // of every knot since the segment began, and start a new segment when that range
 // becomes empty. Within the range, the slope used is the least-squares one.
+//
+// A segment that ends up with a single knot has no slope of its own and borrows
+// its neighbour's. And the last segment is the one that stays open, the line
+// later rows are judged against, so it must rest on more than a page or two: a
+// last segment with fewer than three knots is dropped and the one before it
+// carries on in its place.
 static int
 fit_knots(const Knot *knots, int64 m, double eps, HmSegment **segs_out)
 {
 	int			cap = 64;
 	int			nsegs = 0;
 	HmSegment  *segs = palloc(sizeof(HmSegment) * cap);
+	int64		seg_from = 0;		// first knot of the segment being built
+	int64		last_from = 0;		// first knot of the last segment emitted
 	bool		open = false;
 	int64		x0 = 0;
 	double		y0 = 0.0;
@@ -316,8 +351,9 @@ fit_knots(const Knot *knots, int64 m, double eps, HmSegment **segs_out)
 	int64		j = 0;
 
 #define CLOSE_SEGMENT() \
-	emit_segment(&segs, &nsegs, &cap, x0, \
-				 sxx > 0.0 ? Min(Max(sxy / sxx, slo), shi) : 0.0, y0)
+	(last_from = seg_from, \
+	 emit_segment(&segs, &nsegs, &cap, x0, \
+				  sxx > 0.0 ? Min(Max(sxy / sxx, slo), shi) : NAN, y0))
 
 	while (j < m)
 	{
@@ -342,6 +378,7 @@ fit_knots(const Knot *knots, int64 m, double eps, HmSegment **segs_out)
 				CLOSE_SEGMENT();
 				open = false;
 			}
+			last_from = j;
 			emit_segment(&segs, &nsegs, &cap, x, 0.0, y);
 		}
 		else if (!open)
@@ -352,6 +389,7 @@ fit_knots(const Knot *knots, int64 m, double eps, HmSegment **segs_out)
 			shi = INFINITY;
 			sxx = sxy = 0.0;
 			open = true;
+			seg_from = j;
 		}
 		else
 		{
@@ -367,6 +405,7 @@ fit_knots(const Knot *knots, int64 m, double eps, HmSegment **segs_out)
 				slo = 0.0;
 				shi = INFINITY;
 				sxx = sxy = 0.0;
+				seg_from = j;
 			}
 			else
 			{
@@ -381,6 +420,19 @@ fit_knots(const Knot *knots, int64 m, double eps, HmSegment **segs_out)
 	if (open)
 		CLOSE_SEGMENT();
 #undef CLOSE_SEGMENT
+
+	if (nsegs > 1 && m - last_from < 3)
+		nsegs--;
+
+	for (int s = 1; s < nsegs; s++)
+		if (isnan(segs[s].slope) && segs[s - 1].slope > 0.0)
+			segs[s].slope = segs[s - 1].slope;
+	for (int s = nsegs - 2; s >= 0; s--)
+		if (isnan(segs[s].slope) && segs[s + 1].slope > 0.0)
+			segs[s].slope = segs[s + 1].slope;
+	for (int s = 0; s < nsegs; s++)
+		if (isnan(segs[s].slope))
+			segs[s].slope = 0.0;
 
 	*segs_out = segs;
 	return nsegs;
@@ -403,7 +455,8 @@ model_cost(HmTuple *sample, int64 nsample, HmSegment *segs, int nsegs, const HmO
 			exceptions++;
 		else
 		{
-			const HmSegment *seg = &segs[hm_find_segment(segs, nsegs, sample[i].key)];
+			HmModel		m = {segs, (uint32) nsegs, NULL, (uint32) nsegs};
+			const HmSegment *seg = &segs[hm_find_segment(&m, sample[i].key)];
 
 			pages += (long double) (seg->max_err - seg->min_err + 1);
 		}
@@ -491,6 +544,149 @@ hm_fit(HmTuple *tuples, int64 n, const HmOptions *opts, bool has_floor,
 	return nbest;
 }
 
+// Choose a window from a histogram of how far rows are from a segment's line
+// (slot r + cap holds the rows r pages away; there are 2 * cap + 1 slots).
+//
+// Every lookup in the segment reads every page in its window. So a page at the
+// edge holding fewer than thin rows is not worth it: it is cut, and its rows are
+// stored exactly instead. Nor does a window stretch for one or two rows however
+// small the segment: those are strays. Slots inside [*lo, *hi] on entry are kept
+// whatever they hold; pass lo > hi to protect none. If the histogram is empty the
+// window is left as it was.
+static void
+trim_window(const int64 *hist, int cap, double thin, int *lo_io, int *hi_io)
+{
+	int			keep_lo = *lo_io;
+	int			keep_hi = *hi_io;
+	bool		keep = keep_lo <= keep_hi;
+	int			lo = 0;
+	int			hi = 2 * cap;
+
+	thin = Max(thin, 3.0);
+	while (lo <= 2 * cap && hist[lo] == 0)
+		lo++;
+	if (lo > 2 * cap)
+		return;
+	while (hist[hi] == 0)
+		hi--;
+	if (keep)
+	{
+		lo = Min(lo, keep_lo);
+		hi = Max(hi, keep_hi);
+	}
+
+	for (;;)
+	{
+		bool		can_lo = keep ? lo < keep_lo : lo < hi;
+		bool		can_hi = keep ? hi > keep_hi : lo < hi;
+		int			drop;
+
+		if (!can_lo && !can_hi)
+			break;
+		if (can_lo && can_hi)
+			drop = hist[lo] <= hist[hi] ? lo : hi;
+		else
+			drop = can_lo ? lo : hi;
+		if ((double) hist[drop] >= thin)
+			break;
+
+		if (drop == lo)
+		{
+			lo++;
+			while (hist[lo] == 0 && (keep ? lo < keep_lo : lo < hi))
+				lo++;
+		}
+		else
+		{
+			hi--;
+			while (hist[hi] == 0 && (keep ? hi > keep_hi : hi > lo))
+				hi--;
+		}
+	}
+	*lo_io = lo;
+	*hi_io = hi;
+}
+
+// Grow a segment's window [*min_err, *max_err] to take in the pages these rows
+// are on, leaving out edge pages that hold less than exception_pct percent of
+// population rows (pass a negative population to mean these rows themselves).
+// The window never shrinks: rows already rely on it. Returns how many of the
+// rows are still outside. The segment itself is not changed.
+//
+// A flat segment stands for one key value that fills many pages (see
+// fit_knots). A lookup of that key has to read every page holding it, whatever
+// the index does, so all of those pages go in the window, however far the run
+// stretches and however few rows a page holds.
+int64
+hm_widen(const HmSegment *seg, const HmTuple *tuples, int64 n, const HmOptions *opts,
+		 double population, int32 *min_err, int32 *max_err)
+{
+	int			cap = opts->max_window;
+	int64	   *hist;
+	int64		inside = 0;
+	int64		covered = 0;
+	int64		run_lo = 0;
+	int64		run_hi = 0;
+	bool		run = false;
+	int			lo;
+	int			hi;
+
+	if (seg->slope == 0.0)
+	{
+		int64		at = (int64) hm_predict(seg, seg->start_key);
+
+		for (int64 t = 0; t < n; t++)
+		{
+			int64		r = (int64) tuples[t].blk - at;
+
+			if (tuples[t].key != seg->start_key || r < -HM_MAX_RUN || r > HM_MAX_RUN)
+				continue;
+			run_lo = run ? Min(run_lo, r) : r;
+			run_hi = run ? Max(run_hi, r) : r;
+			run = true;
+		}
+		if (run)
+			cap = Max(cap, (int) Max(-run_lo, run_hi));
+	}
+	// a window set under a larger max_window still has to fit in the histogram
+	if (*min_err <= *max_err)
+		cap = Max(cap, Max(abs(*min_err), abs(*max_err)));
+
+	hist = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(int64) * (2 * (Size) cap + 1));
+	memset(hist, 0, sizeof(int64) * (2 * (Size) cap + 1));
+	for (int64 t = 0; t < n; t++)
+	{
+		int64		r = (int64) tuples[t].blk - (int64) hm_predict(seg, tuples[t].key);
+
+		if (r >= -cap && r <= cap)
+		{
+			hist[r + cap]++;
+			inside++;
+		}
+	}
+
+	lo = *min_err + cap;
+	hi = *max_err + cap;
+	if (run)
+	{
+		bool		had = lo <= hi;
+
+		lo = had ? Min(lo, (int) run_lo + cap) : (int) run_lo + cap;
+		hi = had ? Max(hi, (int) run_hi + cap) : (int) run_hi + cap;
+	}
+	trim_window(hist, cap, opts->exception_pct / 100.0 * (population < 0.0 ? (double) inside : population),
+				&lo, &hi);
+	if (lo <= hi)
+	{
+		for (int j = lo; j <= hi; j++)
+			covered += hist[j];
+		*min_err = lo - cap;
+		*max_err = hi - cap;
+	}
+	pfree(hist);
+	return n - covered;
+}
+
 // Compare tuples (sorted by key) with segs and mark the ones the model does not
 // cover. With set_bounds, the segments are new and each one's window is chosen
 // here: every page that holds a real share of the segment's rows, but not the
@@ -499,8 +695,6 @@ void
 hm_classify(HmTuple *tuples, int64 n, HmSegment *segs, int nsegs,
 			const HmOptions *opts, bool set_bounds)
 {
-	int			cap = opts->max_window;
-	int64	   *hist = set_bounds ? palloc(sizeof(int64) * (2 * cap + 1)) : NULL;
 	int64		i = 0;
 
 	if (nsegs == 0)
@@ -515,7 +709,6 @@ hm_classify(HmTuple *tuples, int64 n, HmSegment *segs, int nsegs,
 		HmSegment  *seg = &segs[s];
 		int64		begin = i;
 		int64		end;
-		int64		inside = 0;
 
 		// seg owns keys below the next segment's start (the first also owns
 		// everything below its own start)
@@ -536,59 +729,9 @@ hm_classify(HmTuple *tuples, int64 n, HmSegment *segs, int nsegs,
 			continue;
 		}
 
-		memset(hist, 0, sizeof(int64) * (2 * cap + 1));
-		for (int64 t = begin; t < end; t++)
-		{
-			int64		r = (int64) tuples[t].blk - (int64) hm_predict(seg, tuples[t].key);
-
-			if (r >= -cap && r <= cap)
-			{
-				hist[r + cap]++;
-				inside++;
-			}
-		}
-
-		if (inside == 0)
-		{
-			seg->min_err = 1;
-			seg->max_err = 0;
-		}
-		else
-		{
-			int			lo = 0;
-			int			hi = 2 * cap;
-			double		thin = opts->exception_pct / 100.0 * (double) inside;
-
-			while (hist[lo] == 0)
-				lo++;
-			while (hist[hi] == 0)
-				hi--;
-
-			// Every page in the window is read by every lookup in this segment. A
-			// page at the edge holding only a sliver of the rows is not worth
-			// that: cut it and store its rows exactly instead.
-			while (lo < hi)
-			{
-				int			drop = hist[lo] <= hist[hi] ? lo : hi;
-
-				if ((double) hist[drop] >= thin)
-					break;
-				if (drop == lo)
-				{
-					lo++;
-					while (hist[lo] == 0)
-						lo++;
-				}
-				else
-				{
-					hi--;
-					while (hist[hi] == 0)
-						hi--;
-				}
-			}
-			seg->min_err = lo - cap;
-			seg->max_err = hi - cap;
-		}
+		seg->min_err = 1;
+		seg->max_err = 0;
+		hm_widen(seg, tuples + begin, end - begin, opts, -1.0, &seg->min_err, &seg->max_err);
 
 		for (int64 t = begin; t < end; t++)
 		{
@@ -598,7 +741,4 @@ hm_classify(HmTuple *tuples, int64 n, HmSegment *segs, int nsegs,
 								   r < seg->min_err || r > seg->max_err);
 		}
 	}
-
-	if (hist)
-		pfree(hist);
 }
