@@ -1,0 +1,13 @@
+rows       index      build_s    index_bytes pages/look   lookup_us heapmap_model
+1000000    btree    .212814334       22487040        4.0         2.4 
+1000000    brin     .107930098          24576      130.1       312.7 
+1000000    heapmap  .137567445          24576        5.0        14.8 3 segments, window 3.0, 13 exceptions
+5000000    btree    .908049462      112336896        4.0         3.0 
+5000000    brin     .401891835          24576      130.1       519.3 
+5000000    heapmap  .458360456          24576        5.0        16.0 19 segments, window 3.0, 96 exceptions
+20000000   btree    3.946066070      449249280        4.0         3.7 
+20000000   brin     1.485201514          40960      132.1       575.2 
+20000000   heapmap  1.571704909          24576        5.0        16.8 71 segments, window 3.0, 361 exceptions
+50000000   btree    8.755567154     1123115008        5.0         4.5 
+50000000   brin     3.824358655          90112      140.1       630.1 
+50000000   heapmap  3.870929177          40960        6.0        16.4 179 segments, window 3.0, 935 exceptions
