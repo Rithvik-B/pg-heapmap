@@ -22,9 +22,10 @@ limits" for what is not done.
 Three parts, and one rule that ties them together.
 
 * **Model.** A piecewise-linear function from key to heap page. Each segment has
-  an error window, usually 1 to 3 pages. Segments are never changed once written.
-* **Tail.** The last few heap pages, which are still being filled. They are not
-  in the model yet and every lookup of a recent key reads all of them.
+  an error window, usually 1 to 3 pages. Segments are sealed once written and
+  never change, except the newest one, which stays open (see below).
+* **Tail.** The heap pages at the end of the table that are still being filled.
+  They are not in the model yet and every lookup of a recent key reads all of them.
 * **Exceptions.** Rows that are not where the model says: late arrivals, rows an
   UPDATE moved, bad timestamps. These are stored exactly, as (key, row pointer),
   in a small B+-tree inside the index.
@@ -37,18 +38,43 @@ and folding re-checks it for each row it moves from the tail into the model.
 **Inserts.** A row that arrives in order lands in the tail and the index writes
 nothing at all. A row that is out of place costs one exception entry.
 
-**Folding.** When the tail grows past `fold_after` pages, the inserting backend
-reads those heap pages, extends the model over them (often by simply carrying
-the last segment forward), and moves the frontier. VACUUM does the same.
+**Folding.** Each time the table has grown by a few pages, the inserting backend
+reads the tail, extends the model over the pages that are settled, and moves the
+frontier. VACUUM does the same.
 
 **Fitting, robust to messy tables.** Each heap page is summarised by its median
 key, the longest non-decreasing run of those medians is kept, and segments are
 fitted through that run. A batch of rows loaded out of place drops out as a
 whole and its rows become exceptions. How tightly the segments follow the data
-is chosen from the data.
+is chosen from the data. A key value that fills many pages gets a flat segment
+whose window is exactly the pages holding it.
 
 If the column does not follow physical order at all, every row becomes an
 exception and the index is, in effect, a B-tree.
+
+### Concurrent writers
+
+When several sessions insert at once, each fills a table page of its own.
+PostgreSQL also grows a busy table up to 64 pages at a time and hands those
+pages out in no particular order. So neighbouring keys end up many pages apart,
+and a page that looks abandoned may simply not have had its turn. Three things
+deal with that:
+
+* **The frontier only passes settled pages**: full ones, and ones that gained no
+  row while plenty of rows arrived elsewhere. A model fitted to half-filled pages
+  describes rows that are not all there yet.
+* **The newest segment stays open.** Rows for keys it already answers for keep
+  turning up on later pages, and its window grows to take them in, as long as
+  that costs lookups less than storing those rows exactly. When new rows stop
+  fitting its line, it is sealed and new segments are fitted.
+* **Stray rows cannot steer the model.** A window does not stretch for one or
+  two rows, a new segment needs a real share of the rows to stand on, sparsely
+  filled pages are ignored when fitting, and the tail's fence comes back down if
+  a row with a key from the future pushed it up.
+
+The result is that lookup cost degrades gradually with the number of concurrent
+writers (the window widens to the scatter that is physically there) while the
+index stays small. Numbers are under "Results".
 
 ## Files
 
@@ -56,70 +82,102 @@ exception and the index is, in effect, a B-tree.
 |---|---|
 | `heapmap.h` | page layouts, the state page, shared declarations |
 | `hm_model.c` | evaluating the model, fitting it, deciding which rows it covers |
-| `hm_build.c` | `CREATE INDEX` / `REINDEX`, appending segments |
+| `hm_build.c` | `CREATE INDEX` / `REINDEX`, appending sealed segments |
 | `hm_insert.c` | inserts, folding the tail into the model, VACUUM |
 | `hm_scan.c` | scans (bitmap only, like BRIN) |
 | `hm_exc.c` | the exception B+-tree |
-| `hm_am.c` | access method handler, options, segment cache, `heapmap_stats()` |
+| `hm_am.c` | access method handler, options, segment cache, inspection functions |
 | `test/` | correctness suite |
-| `eval/quick_compare.sh` | first comparison with btree and BRIN |
+| `demo/demo.sh` | live walk-through against B-tree and BRIN |
+| `eval/quick_compare.sh` | 10M-row comparison with btree and BRIN |
+| `eval/concurrent.sh` | behaviour under 1 to 32 concurrent writers |
 
 ## Running it
+
+Needs PostgreSQL 18 with its server headers (`postgresql-server-dev-18`).
+
+A private test cluster, which needs no sudo and leaves the system one alone:
 
 ```
 ./cluster.sh init        # private cluster on port 5545, first time only
 ./cluster.sh install     # build and install the extension
 ./cluster.sh psql
-test/run_tests.sh        # correctness suite, about 2 minutes
-eval/quick_compare.sh    # 10M rows against btree and BRIN, about 5 minutes
+demo/demo.sh             # live walk-through, about 3 minutes
+test/run_tests.sh        # correctness suite, about 4 minutes
+eval/quick_compare.sh    # 10M rows against btree and BRIN, about 6 minutes
+eval/concurrent.sh       # 1 to 32 concurrent writers
 ```
 
-`cluster.sh` uses the system PostgreSQL 18 (`/usr/lib/postgresql/18/bin`). Set
-`HM_PG_BIN` to use another build.
+Or in the system PostgreSQL, so that it shows up in pgAdmin too:
+
+```
+make USE_PGXS=1 && sudo make USE_PGXS=1 install
+export PGHOST=localhost PGUSER=postgres PGPASSWORD=... PGDATABASE=yourdb   # as in pgAdmin
+HM_SYSTEM=1 demo/demo.sh
+```
+
+The demo creates the extension in that database and six tables whose names
+start with `ev_`, and leaves them there to query afterwards.
+
+`demo/demo.sh [rows] [clients]` builds the same event table three times, one
+index each, and measures everything live: build time, sizes, pages read per
+lookup, a range query, loading more rows, late rows, concurrent inserts with the
+index sizes sampled every two seconds, and a check that the index and a full
+table scan return the same rows. `AUTO=1` runs it without pauses.
+`demo/sample_output.txt` is one run of it.
 
 Useful while exploring:
 
 ```sql
 SELECT * FROM heapmap_stats('events_ts');        -- segments, windows, tail, exceptions
+SELECT * FROM heapmap_segments('events_ts');     -- the model itself, one row per segment
 SELECT * FROM heapmap_window('events_ts', 123);  -- which heap pages a lookup of key 123 reads
 ```
 
 Options: `epsilon` (how tightly segments follow the data, 0 = automatic),
 `exception_pct` (a page holding less than this percent of a segment's rows is
-cut from its window and its rows stored as exceptions, default 1),
-`max_window` (rows further than this many pages from the model are always
-exceptions, default 64), `fold_after` (default 16) and `keep` (default 4).
+cut from its window and its rows stored as exceptions, default 0.25: lower means
+fewer exceptions and wider windows), `max_window` (rows further than this many
+pages from the model are always exceptions, default 64), `fold_after` (default
+16), `keep` (pages always left in the tail, default 4) and `max_tail` (beyond
+this many pages the tail is folded even if still filling, default 512).
 
 Key types: `bigint`, `integer`, `timestamp`, `timestamptz`, `date`.
 
 ## Testing
 
 `test/run_tests.sh` compares the exact set of rows the index returns with a
-sequential scan, for random equality and range predicates, on fifteen tables:
+sequential scan, for random equality and range predicates, on sixteen tables:
 sorted, jittered, 2% late rows, whole batches out of place, heavy duplicates,
-fully random, negative keys, NULLs, empty, one row, one repeated key, and each
-key type. The checks are repeated after appends, late inserts, row-at-a-time
-inserts, updates that move rows and updates that do not, deletes, VACUUM, reuse
-of freed space, and REINDEX. It then runs 16 concurrent clients inserting,
-reading and deleting, and finally stops the server with an immediate shutdown
-right after a bulk insert and checks again after recovery.
+fully random, negative keys, NULLs, empty, one row, one repeated key, rows of
+very different lengths, and each key type. The checks are repeated after
+appends, late inserts, row-at-a-time inserts, updates that move rows and updates
+that do not, deletes, VACUUM, reuse of freed space, and REINDEX. It then runs 16
+concurrent clients inserting, reading and deleting, and finally stops the server
+with an immediate shutdown right after a bulk insert and checks again after
+recovery.
 
-## First results
+## Results
 
-10M rows, keys increasing with a random gap, `(k bigint, payload int)`, 423 MB
-table. PostgreSQL 18.6, i7-13620H, everything cached. Timings are medians of 5
-rounds with the indexes taking turns. One run on one machine: treat the timings
-as indicative and the sizes and page counts as exact.
+PostgreSQL 18.6, i7-13620H (16 threads), everything cached. One run on one
+machine: treat the timings as indicative and the sizes and page counts as exact.
+Raw output is in `eval/results/`.
+
+### One writer: 10M rows, then 2M more
+
+Keys increasing with a random gap, `(k bigint, payload int)`, 423 MB table.
+Timings are medians of 5 rounds with the indexes taking turns.
 
 | | btree | BRIN | BRIN, 8 pages per range | heapmap |
 |---|---|---|---|---|
 | Index size | 214 MB | 32 kB | 240 kB | 24 kB |
-| Build | 1.83 s | 0.72 s | 0.72 s | 0.81 s |
+| Build | 2.18 s | 0.78 s | 0.79 s | 0.86 s |
 | Pages read per point lookup | 4 | 131 | 45 | 5 |
-| Point lookup, in server | 2.5 µs | 493 µs | 512 µs | 15 µs |
-| Range query, about 10,000 rows | 725 µs | 1,222 µs | 1,192 µs | 596 µs |
-| Loading 2M more rows | 2.01 s | 0.96 s | 0.87 s | 1.08 s |
+| Point lookup, in server | 2.6 µs | 537 µs | 567 µs | 15.9 µs |
+| Range query, about 10,000 rows | 735 µs | 1,250 µs | 1,247 µs | 594 µs |
+| Loading 2M more rows | 2.24 s | 1.02 s | 0.94 s | 1.23 s |
 | WAL written by that load | 264 MB | 139 MB | 138 MB | 138 MB |
+| Index size after the load | 257 MB | 32 kB | 240 kB | 24 kB |
 
 Read plainly: the index is the size of BRIN and about 30 times faster than BRIN
 on point lookups. Against the B-tree it is several thousand times smaller, loads
@@ -127,18 +185,47 @@ data about twice as fast and is on par for range queries, but a cached point
 lookup is about six times slower, because it filters whole heap pages where the
 B-tree goes straight to the row.
 
+### Many writers
+
+Each session runs `INSERT INTO t VALUES (nextval('seq'))` for 8 seconds,
+`synchronous_commit` off. "Window" is the average number of heap pages a lookup
+reads; it grows because that is how far apart PostgreSQL puts neighbouring keys.
+
+| Sessions | Rows | Stored as exceptions | Window | heapmap | btree |
+|---|---|---|---|---|---|
+| 1 | 0.40M | 0.00% | 2 | 24 kB | 8.8 MB |
+| 2 | 0.69M | 0.03% | 4.5 | 24 kB | 15 MB |
+| 4 | 1.13M | 0.04% | 9 | 40 kB | 24 MB |
+| 8 | 1.81M | 0.07% | 21 | 96 kB | 39 MB |
+| 16 | 2.18M | 1.15% | 36 | 752 kB | 47 MB |
+| 32 | 2.17M | 6.20% | 47 | 2.9 MB | 47 MB |
+
+With a mix of single-row inserts, 300-row inserts, late rows, reads and deletes:
+0.25% exceptions with 4 sessions (384 kB against a 92 MB btree) and 1.66% with
+16 (1.3 MB against 58 MB).
+
+Before the open segment and the settled-page rule, the 16-session run stored 86%
+of its rows as exceptions and the index was as large as the B-tree.
+
 ## Known limits
 
-* **Concurrent writers.** With many sessions appending at once, rows interleave
-  across heap pages and a large share end up as exceptions (about 38% in the
-  16-client test, which also uses a deliberately small tail). Answers stay
-  correct, but the size advantage goes. The planned fix is to keep the newest
-  segment open so its window can widen.
+* **Very many writers.** The window grows with the number of sessions inserting
+  at once, and past `max_window` pages of scatter rows become exceptions (6% at
+  32 sessions on this machine). 64 sessions on 16 threads was not usable.
 * **Point lookups are slower than a B-tree when cached**, as above.
 * **Bitmap scans only.** No `ORDER BY` from the index, no unique constraints, no
   index-only scans, one column.
 * **Updates.** An update that moves a row to another page costs an exception.
   The index suits append-mostly tables.
+* **Space reused far from the end of the table.** Rows that PostgreSQL places in
+  old pages are out of place and cost an exception each. That includes space
+  freed by DELETE and VACUUM, short rows that fit into gaps left in earlier
+  pages (about 1% of rows in the variable-length test table), and the run of up
+  to 64 empty pages a bulk load leaves behind, if it is filled only after the
+  model has moved past it.
+* **Sessions that pause.** A session that stops inserting for a while and then
+  carries on in the page it had been filling may find the frontier has passed
+  it; the rest of that page becomes exceptions.
 * **Build memory.** `CREATE INDEX` holds one 16-byte record per row in memory.
 * **The planner** estimates bitmap heap scans as if rows were scattered, so it
   gives up on this index (and on BRIN) for wide ranges sooner than it should.
