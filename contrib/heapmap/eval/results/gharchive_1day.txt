@@ -1,0 +1,30 @@
+== loading /home/rithvik/Desktop/acad/cs631/project/pg-heapmap/contrib/heapmap/eval/data/gh_events.csv
+rows: 3879843  (first 3685850 loaded now, the rest appended later)
+== how out of order is the real stream? (rows whose timestamp is behind the running maximum)
+7467 rows behind, 0.192%  (max lag 00:57:51)
+distinct seconds: 86309, events per second: 45.0
+table: 342 MB
+== index build (seconds, one core) and size
+btree: .908400578 s, 25 MB
+brin: .352423271 s, 32 kB
+heapmap: .735554584 s, 136 kB
+heapmap model: 261 segments, window avg 5.28 max 7, 6390 exceptions, tail 30 pages
+== pages touched by 'events at this second' (index + table), averaged over 300 timestamps
+btree: 4.0 pages per lookup, 44.9 rows returned on average
+brin: 459.6 pages per lookup, 44.9 rows returned on average
+heapmap: 8.1 pages per lookup, 44.9 rows returned on average
+== warm lookup time in the server (microseconds, median of 5 alternating rounds)
+btree: 11.0
+brin: 1866.8
+heapmap: 29.0
+== 'everything in a 5 minute window' (about 13486 rows; microseconds, median of 5)
+btree: 480.3
+brin: 3142.1
+heapmap: 826.8
+== appending the remaining 193993 events in arrival order (seconds, WAL, index size after)
+btree: .451898250 s, WAL 46 MB, index now 27 MB
+brin: .368956506 s, WAL 34 MB, index now 32 kB
+heapmap: .403734475 s, WAL 34 MB, index now 176 kB
+heapmap after append: 349 segments, window avg 4.70, 8091 exceptions, 189 folds
+== heapmap agrees with a sequential scan
+gh_check: ok (10 rounds)
