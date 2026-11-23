@@ -179,7 +179,7 @@ FROM heapmap_segments('ev_heapmap_ts') ORDER BY segment LIMIT 6;"
 note "Each segment is a straight line from timestamp to table page. The window is"
 note "how far a row can be from the line. A lookup reads only the pages in it:"
 show "SELECT first_page, last_page, scans_tail
-FROM heapmap_window('ev_heapmap_ts', (extract(epoch FROM timestamptz '$T' - timestamptz '2000-01-01') * 1e6)::bigint);"
+FROM heapmap_window('ev_heapmap_ts', (extract(epoch FROM timestamptz '$T' - timestamptz '2000-01-01 00:00:00+00') * 1e6)::bigint);"
 pause
 
 # ---------------------------------------------------------------------------
