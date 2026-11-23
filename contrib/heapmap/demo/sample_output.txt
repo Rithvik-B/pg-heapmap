@@ -1,0 +1,227 @@
+heapmap: a learned block-range index for PostgreSQL
+   PostgreSQL 18.6 (Ubuntu 18.6-1.pgdg24.04+2) on x86_64-pc-linux-gnu, database hm_test
+   An event log of 5000000 rows. Timestamps only move forward, as in any log.
+   Three copies of the table, identical row for row, one index each.
+
+== 1. Load the table
+NOTICE:  extension "heapmap" already exists, skipping
+NOTICE:  table "ev_src" does not exist, skipping
+NOTICE:  table "ev_btree" does not exist, skipping
+NOTICE:  table "ev_brin" does not exist, skipping
+NOTICE:  table "ev_heapmap" does not exist, skipping
+NOTICE:  table "ev_more" does not exist, skipping
+NOTICE:  table "ev_keys" does not exist, skipping
+   | CREATE UNLOGGED TABLE ev_src AS
+   | SELECT timestamptz '2026-01-01' + sum(1 + (random() * 2000)::int) OVER (ORDER BY i) * interval '1 millisecond' AS ts,
+   |        (random() * 1000)::int AS device, random() AS reading
+   | FROM generate_series(1, 5000000) i;
+   | SELECT count(*) AS rows, min(ts) AS first_event, max(ts) AS last_event,
+   |        pg_size_pretty(pg_relation_size('ev_heapmap')) AS table_size FROM ev_heapmap;
+  rows   |         first_event          |          last_event          | table_size 
+---------+------------------------------+------------------------------+------------
+ 5000000 | 2026-01-01 00:00:01.29+05:30 | 2026-02-27 22:11:01.62+05:30 | 249 MB
+(1 row)
+
+
+== 2. Build one index on each copy
+   | CREATE INDEX ev_btree_ts ON ev_btree USING btree (ts);
+   | CREATE INDEX ev_brin_ts ON ev_brin USING brin (ts);
+   | CREATE INDEX ev_heapmap_ts ON ev_heapmap USING heapmap (ts);
+
+                                              B-tree           BRIN        heapmap
+                                              ------           ----        -------
+   build time, one core (s)                     1.30           0.51           0.47
+   index size                                 107 MB          24 kB          24 kB
+   
+   The B-tree stores every timestamp with a row pointer. BRIN stores a min and
+   max per 128 table pages. heapmap stores a few line segments that say which
+   table page each timestamp is on, and nothing per row.
+
+== 3. Find one event by its timestamp
+   | EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF)
+   | SELECT * FROM ev_btree WHERE ts = '2026-01-29 23:03:46.634+05:30';
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Index Scan using ev_btree_ts on ev_btree (actual rows=1.00 loops=1)
+   Index Cond: (ts = '2026-01-29 23:03:46.634+05:30'::timestamp with time zone)
+   Index Searches: 1
+   Buffers: shared hit=1 read=3
+ Planning:
+   Buffers: shared hit=73
+(6 rows)
+
+   | EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF)
+   | SELECT * FROM ev_brin WHERE ts = '2026-01-29 23:03:46.634+05:30';
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Bitmap Heap Scan on ev_brin (actual rows=1.00 loops=1)
+   Recheck Cond: (ts = '2026-01-29 23:03:46.634+05:30'::timestamp with time zone)
+   Rows Removed by Index Recheck: 20095
+   Heap Blocks: lossy=128
+   Buffers: shared hit=143
+   ->  Bitmap Index Scan on ev_brin_ts (actual rows=1280.00 loops=1)
+         Index Cond: (ts = '2026-01-29 23:03:46.634+05:30'::timestamp with time zone)
+         Index Searches: 1
+         Buffers: shared hit=15
+ Planning:
+   Buffers: shared hit=70
+(11 rows)
+
+   | EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF)
+   | SELECT * FROM ev_heapmap WHERE ts = '2026-01-29 23:03:46.634+05:30';
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Bitmap Heap Scan on ev_heapmap (actual rows=1.00 loops=1)
+   Recheck Cond: (ts = '2026-01-29 23:03:46.634+05:30'::timestamp with time zone)
+   Rows Removed by Index Recheck: 470
+   Heap Blocks: lossy=3
+   Buffers: shared hit=6
+   ->  Bitmap Index Scan on ev_heapmap_ts (actual rows=30.00 loops=1)
+         Index Cond: (ts = '2026-01-29 23:03:46.634+05:30'::timestamp with time zone)
+         Index Searches: 1
+         Buffers: shared hit=3
+ Planning:
+   Buffers: shared hit=70
+(11 rows)
+
+   "Buffers" is the number of 8 kB pages the query touched, index and table together.
+
+==    The same, averaged over many timestamps
+                                              B-tree           BRIN        heapmap
+                                              ------           ----        -------
+   pages touched per lookup                      4.0          130.0            5.0
+   time per lookup, cached (µs)                 6.7          457.8           15.7
+
+== 4. One hour of events
+   | EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF)
+   | SELECT count(*), avg(reading) FROM ev_heapmap WHERE ts >= '2026-01-29 23:03:46.634+05:30' AND ts < timestamptz '2026-01-29 23:03:46.634+05:30' + interval '1 hour';
+                                                                                         QUERY PLAN                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   Buffers: shared hit=29
+   ->  Bitmap Heap Scan on ev_heapmap (actual rows=3590.00 loops=1)
+         Recheck Cond: ((ts >= '2026-01-29 23:03:46.634+05:30'::timestamp with time zone) AND (ts < ('2026-01-29 23:03:46.634+05:30'::timestamp with time zone + '01:00:00'::interval)))
+         Rows Removed by Index Recheck: 492
+         Heap Blocks: lossy=26
+         Buffers: shared hit=29
+         ->  Bitmap Index Scan on ev_heapmap_ts (actual rows=260.00 loops=1)
+               Index Cond: ((ts >= '2026-01-29 23:03:46.634+05:30'::timestamp with time zone) AND (ts < ('2026-01-29 23:03:46.634+05:30'::timestamp with time zone + '01:00:00'::interval)))
+               Index Searches: 1
+               Buffers: shared hit=3
+ Planning:
+   Buffers: shared hit=90
+(13 rows)
+
+                                              B-tree           BRIN        heapmap
+                                              ------           ----        -------
+   one-hour query, cached (ms)                  0.33           1.29           0.30
+
+== 5. What is inside the heapmap index
+   | SELECT segments, round(avg_window::numeric, 1) AS pages_per_lookup, tail_pages, exception_entries,
+   |        pg_size_pretty(index_bytes) AS size FROM heapmap_stats('ev_heapmap_ts');
+ segments | pages_per_lookup | tail_pages | exception_entries | size  
+----------+------------------+------------+-------------------+-------
+       27 |              3.0 |         25 |               106 | 24 kB
+(1 row)
+
+   | SELECT segment, to_timestamp(start_key / 1e6 + 946684800) AS from_time,
+   |        round((pages_per_key * 1e6)::numeric, 4) AS pages_per_second, round(page_at_start::numeric, 1) AS page_at_start,
+   |        window_from, window_to, is_open
+   | FROM heapmap_segments('ev_heapmap_ts') ORDER BY segment LIMIT 6;
+ segment |           from_time           | pages_per_second | page_at_start | window_from | window_to | is_open 
+---------+-------------------------------+------------------+---------------+-------------+-----------+---------
+       1 | 2026-01-01 00:01:25.373+05:30 |           0.0064 |           0.5 |          -1 |         1 | f
+       2 | 2026-01-02 16:34:09.898+05:30 |           0.0064 |         930.5 |          -1 |         1 | f
+       3 | 2026-01-05 07:10:07.181+05:30 |           0.0064 |        2363.5 |          -1 |         1 | f
+       4 | 2026-01-08 11:52:20.669+05:30 |           0.0064 |        4123.5 |          -1 |         1 | f
+       5 | 2026-01-12 01:01:17.741+05:30 |           0.0064 |        6073.5 |          -1 |         1 | f
+       6 | 2026-01-14 07:46:58.532+05:30 |           0.0064 |        7326.5 |          -1 |         1 | f
+(6 rows)
+
+   Each segment is a straight line from timestamp to table page. The window is
+   how far a row can be from the line. A lookup reads only the pages in it:
+   | SELECT first_page, last_page, scans_tail
+   | FROM heapmap_window('ev_heapmap_ts', (extract(epoch FROM timestamptz '2026-01-29 23:03:46.634+05:30' - timestamptz '2000-01-01') * 1e6)::bigint);
+ first_page | last_page | scans_tail 
+------------+-----------+------------
+      16048 |     16050 | f
+(1 row)
+
+
+== 6. Keep loading: 1000000 more rows into each table
+                                              B-tree           BRIN        heapmap
+                                              ------           ----        -------
+   load time (s)                                1.09           0.55           0.63
+   write-ahead log produced                   140 MB          77 MB          77 MB
+   index size now                             129 MB          24 kB          24 kB
+   
+   A row that arrives in order costs heapmap nothing: the newest table pages
+   are always searched, and every few pages the model is extended over them.
+
+== 7. Rows that do not fit the pattern
+   1,000 events arrive late, with timestamps from all over the past:
+   | INSERT INTO ev_heapmap
+   | SELECT timestamptz '2026-01-01' + random() * (timestamptz '2026-01-29 23:03:46.634+05:30' - timestamptz '2026-01-01') + interval '0.5 microsecond', -1, 0
+   | FROM generate_series(1, 1000);
+   Then the log carries on as usual, and the pages holding the late rows join the model:
+   | INSERT INTO ev_heapmap
+   | SELECT (SELECT max(ts) FROM ev_heapmap) + i * interval '1 second', 0, 0 FROM generate_series(1, 20000) i;
+   exception entries: 117 before, 1117 after. Each late row is stored exactly, like a B-tree entry.
+   | SELECT ts, device FROM ev_heapmap WHERE ts = '2026-01-21 22:32:23.742183+05:30';
+                ts                | device 
+----------------------------------+--------
+ 2026-01-21 22:32:23.742183+05:30 |     -1
+(1 row)
+
+   And a row whose timestamp is changed is still found under the new one:
+   | UPDATE ev_heapmap SET ts = ts + interval '3 days' WHERE ts = '2026-01-21 22:32:23.742183+05:30';
+   | SELECT ts, device FROM ev_heapmap WHERE ts = timestamptz '2026-01-21 22:32:23.742183+05:30' + interval '3 days';
+                ts                | device 
+----------------------------------+--------
+ 2026-01-24 22:32:23.742183+05:30 |     -1
+(1 row)
+
+
+== 8. 8 sessions inserting at once, for 12 seconds
+   Every transaction adds the same event to all three tables. Growth of each index, live:
+   second     rows added         B-tree           BRIN        heapmap
+        2         135755       +2992 kB       +0 bytes    +8192 bytes
+        4         285390       +6256 kB       +0 bytes         +24 kB
+        6         432135       +9480 kB       +0 bytes         +24 kB
+        8         573110         +12 MB    +8192 bytes         +40 kB
+       10         674014         +14 MB    +8192 bytes         +40 kB
+       12         761814         +16 MB    +8192 bytes         +56 kB
+   761814 rows added to each table, 63515 transactions per second.
+   
+   Sessions inserting at the same time each fill a table page of their own, so
+   neighbouring timestamps end up several pages apart. heapmap answers by reading
+   a wider window for those timestamps, and stores exactly the few rows left over:
+   | SELECT segments, max_window AS widest_window, tail_pages, exception_entries,
+   |        round(100.0 * exception_entries / 6782814, 2) AS percent_of_rows, pg_size_pretty(index_bytes) AS size
+   | FROM heapmap_stats('ev_heapmap_ts');
+ segments | widest_window | tail_pages | exception_entries | percent_of_rows | size  
+----------+---------------+------------+-------------------+-----------------+-------
+      769 |           103 |         24 |              2025 |            0.03 | 96 kB
+(1 row)
+
+
+== 9. Is every answer right?
+   40 random questions, answered once through the index and once by reading the
+   whole table. The two must return exactly the same rows.
+NOTICE:  40 of 40 questions answered identically
+
+== Summary
+                                              B-tree           BRIN        heapmap
+                                              ------           ----        -------
+   index size at the start                    107 MB          24 kB          24 kB
+   index size at the end                      145 MB          32 kB          96 kB
+   build time (s)                               1.30           0.51           0.47
+   pages touched per lookup                      4.0          130.0            5.0
+   time per lookup, cached (µs)                 6.7          457.8           15.7
+   one-hour query, cached (ms)                  0.33           1.29           0.30
+   loading 20% more rows (s)                    1.09           0.55           0.63
+   write-ahead log for that load              140 MB          77 MB          77 MB
+
+   The tables stay in place (ev_btree, ev_brin, ev_heapmap), so you can go on
+   querying them from psql or pgAdmin. To remove them:
+     DROP TABLE ev_src, ev_btree, ev_brin, ev_heapmap, ev_more, ev_keys;
