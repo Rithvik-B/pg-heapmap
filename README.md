@@ -1,6 +1,13 @@
 PostgreSQL Database Management System
 =====================================
 
+> **CS 631 project: the heapmap index.** This tree is PostgreSQL 18.7 plus one
+> addition, `contrib/heapmap`: a learned block-range index access method
+> (`CREATE INDEX ... USING heapmap`) for columns that follow the table's
+> physical order. Start at [contrib/heapmap/README.md](contrib/heapmap/README.md).
+> The first commit of this repository is the unmodified PostgreSQL source;
+> everything else is in the commits after it.
+
 This directory contains the source code distribution of the PostgreSQL
 database management system.
 

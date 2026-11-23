@@ -1,0 +1,4 @@
+comment = 'learned block-range index: a model of where keys are in the table, for columns that follow its physical order'
+default_version = '1.0'
+module_pathname = 'heapmap'
+relocatable = true
