@@ -88,13 +88,22 @@ index stays small. Numbers are under "Results".
 | `hm_exc.c` | the exception B+-tree |
 | `hm_am.c` | access method handler, options, segment cache, inspection functions |
 | `test/` | correctness suite |
-| `demo/demo.sh` | live walk-through against B-tree and BRIN |
+| `demo/demo.sh` | live walk-through against B-tree and BRIN; `demo/DEMO_GUIDE.md` says what to show and say |
+| `demo/demo_real.sh` | second act on one day of real GitHub events |
 | `eval/quick_compare.sh` | 10M-row comparison with btree and BRIN |
 | `eval/concurrent.sh` | behaviour under 1 to 32 concurrent writers |
+| `eval/gharchive.sh` | a real event stream: one day of GH Archive, with `eval/gharchive_extract.py` |
+| `eval/scale.sh` | 1M to 50M rows |
+| `eval/plots.py`, `eval/results/` | figures for the report, raw output of every run |
+| `doc/` | the project report (`report.html`, built to `report.pdf` by `build_report.sh`) and its figures |
 
 ## Running it
 
-Needs PostgreSQL 18 with its server headers (`postgresql-server-dev-18`).
+This directory is `contrib/heapmap` of a PostgreSQL 18.7 source tree. It builds
+like any contrib module, in-tree (`./configure` at the top, then
+`make -C contrib/heapmap`) or against an installed PostgreSQL 18 with its
+server headers (`postgresql-server-dev-18`) using `make USE_PGXS=1`. The
+scripts below use the installed one.
 
 A private test cluster, which needs no sudo and leaves the system one alone:
 
@@ -103,9 +112,12 @@ A private test cluster, which needs no sudo and leaves the system one alone:
 ./cluster.sh install     # build and install the extension
 ./cluster.sh psql
 demo/demo.sh             # live walk-through, about 3 minutes
+demo/demo_real.sh        # one day of real GitHub events (after eval/gharchive.sh)
 test/run_tests.sh        # correctness suite, about 4 minutes
 eval/quick_compare.sh    # 10M rows against btree and BRIN, about 6 minutes
 eval/concurrent.sh       # 1 to 32 concurrent writers
+eval/gharchive.sh        # real data, needs the CSV described at the top of the script
+eval/scale.sh            # 1M to 50M rows, about 15 minutes
 ```
 
 Or in the system PostgreSQL, so that it shows up in pgAdmin too:
@@ -159,7 +171,7 @@ recovery.
 
 ## Results
 
-PostgreSQL 18.6, i7-13620H (16 threads), everything cached. One run on one
+PostgreSQL 18.7, i7-13620H (16 threads), everything cached. One run on one
 machine: treat the timings as indicative and the sizes and page counts as exact.
 Raw output is in `eval/results/`.
 
@@ -207,6 +219,41 @@ With a mix of single-row inserts, 300-row inserts, late rows, reads and deletes:
 Before the open segment and the settled-page rule, the 16-session run stored 86%
 of its rows as exceptions and the index was as large as the B-tree.
 
+### A real event stream: one day of GitHub
+
+Every public GitHub event of 1 January 2024 from GH Archive, 3,879,843 events
+in the order they were recorded, indexed on `created_at` (one-second
+resolution, 45 events per second). 0.19% of events have a timestamp behind an
+earlier event, by up to 58 minutes. The first 95% are loaded and indexed, the
+last 5% appended afterwards. Raw output: `eval/results/gharchive_1day.txt`.
+
+| | btree | BRIN | heapmap |
+|---|---|---|---|
+| Index size (table 342 MB) | 25 MB | 32 kB | 136 kB |
+| Build time | 0.91 s | 0.35 s | 0.74 s |
+| Pages read per "events at this second" (45 rows) | 4.0 | 459.6 | 8.1 |
+| Time per such lookup, cached | 11 µs | 1,867 µs | 29 µs |
+| "Everything in a 5-minute window" (13,500 rows) | 480 µs | 3,142 µs | 827 µs |
+| Appending the last 194k events | 0.45 s, 46 MB WAL | 0.37 s, 34 MB | 0.40 s, 34 MB |
+| Index size after the append | 27 MB | 32 kB | 176 kB |
+
+The model has 261 segments with an average window of 5.3 pages and 6,390
+exception entries, 0.17% of the rows: the share of the stream that really is
+out of order. BRIN suffers from exactly those rows, because one late event in
+a 128-page range stretches that range's minimum and a lookup then matches
+several ranges.
+
+### Scaling with table size
+
+Same generated rows as the 10M comparison. Raw output: `eval/results/scale.txt`.
+
+| Rows | btree size | heapmap size | btree build | heapmap build | pages per lookup btree / BRIN / heapmap | heapmap model |
+|---|---|---|---|---|---|---|
+| 1M | 21 MB | 24 kB | 0.21 s | 0.14 s | 4 / 130 / 5 | 3 segments, 13 exceptions |
+| 5M | 107 MB | 24 kB | 0.91 s | 0.46 s | 4 / 130 / 5 | 19 segments, 96 exceptions |
+| 20M | 428 MB | 24 kB | 3.95 s | 1.57 s | 4 / 132 / 5 | 71 segments, 361 exceptions |
+| 50M | 1,071 MB | 40 kB | 8.76 s | 3.87 s | 5 / 140 / 6 | 179 segments, 935 exceptions |
+
 ## Known limits
 
 * **Very many writers.** The window grows with the number of sessions inserting
@@ -229,4 +276,4 @@ of its rows as exceptions and the index was as large as the B-tree.
 * **Build memory.** `CREATE INDEX` holds one 16-byte record per row in memory.
 * **The planner** estimates bitmap heap scans as if rows were scattered, so it
   gives up on this index (and on BRIN) for wide ranges sooner than it should.
-* Not yet measured: cold-cache lookups, real datasets, tables above 12M rows.
+* Not yet measured: cold-cache lookups.

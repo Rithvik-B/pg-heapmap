@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>heapmap: a learned block-range index for PostgreSQL 18</title>
+<style>
+  @page { size: A4; margin: 18mm 17mm 18mm 17mm; }
+  body { font-family: "Liberation Serif", "Times New Roman", serif; font-size: 10.3pt; line-height: 1.24; color: #111; max-width: 180mm; margin: 0 auto; }
+  h1 { font-size: 17pt; margin: 0 0 2pt 0; }
+  h2 { font-size: 12.5pt; margin: 13pt 0 4pt 0; border-bottom: 1px solid #999; padding-bottom: 1pt; }
+  h3 { font-size: 11pt; margin: 9pt 0 3pt 0; }
+  p { margin: 0 0 6pt 0; text-align: justify; }
+  .meta { font-size: 10pt; margin-bottom: 8pt; }
+  .repo { border: 1.5px solid #333; padding: 5pt 8pt; margin: 6pt 0 10pt 0; font-size: 10.5pt; background: #f6f6f6; }
+  code, pre { font-family: "Liberation Mono", "DejaVu Sans Mono", monospace; font-size: 8.8pt; }
+  pre { background: #f4f4f4; border: 1px solid #ddd; padding: 4pt 6pt; margin: 4pt 0 7pt 0; white-space: pre-wrap; }
+  table { border-collapse: collapse; margin: 4pt auto 8pt auto; font-size: 9.3pt; }
+  th, td { border: 1px solid #bbb; padding: 2pt 6pt; text-align: right; white-space: nowrap; }
+  td.w { white-space: normal; }
+  th:first-child, td:first-child { text-align: left; }
+  th { background: #eee; font-weight: bold; }
+  caption { caption-side: top; font-size: 9.3pt; font-weight: bold; margin-bottom: 2pt; text-align: left; }
+  figure { margin: 6pt 0 8pt 0; text-align: center; page-break-inside: avoid; }
+  figure img { width: 100%; max-width: 150mm; }
+  figcaption { font-size: 9.3pt; margin-top: 2pt; text-align: left; }
+  ul, ol { margin: 0 0 6pt 0; padding-left: 18pt; }
+  li { margin-bottom: 2pt; }
+  .two { display: flex; gap: 12pt; }
+  .two > * { flex: 1; }
+  .small { font-size: 9.3pt; }
+</style>
+</head>
+<body>
+
+<h1>heapmap: a learned block-range index for PostgreSQL 18</h1>
+<div class="meta">
+CS 631 course project, Autumn 2026, IIT Bombay.<br>
+Bathula Rithvik (23B0939) and Nischal (23B1024).
+</div>
+<div class="repo">
+<b>Code:</b> <a href="REPO_URL">REPO_URL</a><br>
+The first commit is the unmodified PostgreSQL 18.7 source. Everything the project adds is in
+<code>contrib/heapmap</code> (about 3,100 lines of C, plus tests, experiments and the demo), added in the commits after it.
+</div>
+
+<h2>1. Summary</h2>
+<p>
+We added a new index access method to PostgreSQL, <code>CREATE INDEX ... USING heapmap</code>, for
+columns whose values follow the physical order of the table: the timestamp of a log, an
+event stream, a serial id. For such a column, "key to heap page" is a smooth increasing function.
+The index stores a piecewise-linear model of that function and nothing per row. A lookup asks the
+model which few heap pages to read, and PostgreSQL filters the rows on them. Rows that are not
+where the model says, such as late arrivals or updated rows, are stored exactly in a small B+-tree
+inside the index, so every answer is exact.
+</p>
+<p>
+On a 10M-row table the index is 24 kB where a B-tree is 214 MB, builds in less than half the time,
+loads new rows about twice as fast, matches the B-tree on range queries and is 30 times faster than
+BRIN on point lookups at BRIN's size. On one day of real GitHub events (3.9M rows) it is 136 kB
+against a 25 MB B-tree and reads 8 heap pages per lookup where BRIN reads 460. The hardest part was
+keeping the model useful when many sessions insert at once; the final design stores about 1% of rows
+as exceptions with 16 concurrent writers, down from 86% in our first version.
+</p>
+
+<h2>2. The problem and the use case</h2>
+<p>
+PostgreSQL offers two kinds of index for a timestamp column in an append-mostly table. A B-tree is
+exact and fast but stores every key with a row pointer, so it is as large as the column, grows with
+every insert and doubles the write-ahead log of a bulk load. BRIN (block-range index) stores only a
+minimum and a maximum per 128 heap pages, so it is tiny, but every lookup reads a whole block range
+and discards almost all of it: 130 pages and 20,000 rows to find one. There is nothing in between.
+</p>
+<p>
+Yet for these columns the physical position of a row is almost a function of its key. Learned index
+structures (Kraska et al., SIGMOD 2018) exploit exactly this, but the published designs index a
+sorted in-memory array and need rebuilding when data changes. The question of this project is
+whether the idea can be made to work <i>inside a real database engine</i>, against heap pages rather
+than an array, with inserts, updates, deletes, VACUUM, concurrency and crash recovery, and whether
+the result is useful compared with what PostgreSQL already has. The target users are the same
+tables people put BRIN on today: logs, sensor readings, orders and events, queried by time.
+</p>
+
+<h2>3. Design</h2>
+<p>Three parts, and one rule that ties them together.</p>
+<ul>
+<li><b>Model.</b> A piecewise-linear function from key to heap page number. Each segment has a start key,
+a slope, a page at its start and an error window, usually one to three pages wide. A lookup of key
+<i>k</i> finds the segment by binary search, computes the page and reads the pages in the window. A
+range query maps both ends and reads the pages between. Segments are sealed once written and never
+change, except the newest one, which stays open (section 4.2).</li>
+<li><b>Tail.</b> The heap pages at the end of the table that are still being filled. They are not in the
+model yet. A lookup of a key at or above the tail's <i>fence</i> key reads all tail pages (a few
+dozen at most). This is what makes an insert free: a row that arrives in order lands in the tail and
+the index writes nothing at all.</li>
+<li><b>Exceptions.</b> Rows that are not where the model says: late arrivals, rows an UPDATE moved,
+bad timestamps. They are stored exactly, as (key, row pointer), in a small B+-tree inside the index.
+If a column does not follow physical order at all, every row becomes an exception and the index
+degrades gracefully into a B-tree.</li>
+</ul>
+<p>
+<b>The invariant.</b> Every indexed row is either in the tail with a key at or above the fence, or on a
+page inside the model's window for its key, or in the exception tree. <code>CREATE INDEX</code>
+establishes this, every insert re-checks it for the new row, and folding re-checks it for every row
+it moves from the tail into the model. Because scans are bitmap scans, the heap scan rechecks the
+predicate and visibility on every page, so the index may only ever be <i>too generous</i>, never
+wrong.
+</p>
+<p>
+<b>Folding.</b> Each time the table has grown by a few pages, the inserting backend reads the tail,
+fits new segments over the pages that are settled, stores any row that does not fit as an exception,
+and moves the frontier. VACUUM does the same and removes dead exception entries. Fitting
+summarises each heap page by its median key, keeps the longest non-decreasing run of those medians,
+fits segments through the run and sizes each window from the rows themselves; how tightly segments
+follow the data is chosen from the data (a cost model trades window width against exceptions). A
+key value that fills many pages gets a flat segment whose window is exactly those pages.
+</p>
+<figure>
+<img src="figures/model_real_data.png" alt="model on real data">
+<figcaption><b>Figure 1.</b> The model fitted to one day of real GitHub events, indexed on
+<code>created_at</code>. Left: 349 segments over 46,000 heap pages. Right: three minutes of it, with each
+segment's window shaded. Grey dots are a 0.5% sample of the rows' real positions.</figcaption>
+</figure>
+
+<h2>4. Implementation in PostgreSQL</h2>
+<h3>4.1 What was built</h3>
+<p>
+The extension lives in <code>contrib/heapmap</code> and uses only public server APIs: the index access
+method interface (<code>IndexAmRoutine</code>), generic WAL (<code>GenericXLog</code>) for crash safety,
+the buffer manager, reloptions and the bitmap scan machinery. No core file was changed; the two
+<code>contrib</code> build lists and the root README are the only edits outside the new directory.
+</p>
+<table class="small">
+<tr><th>file</th><th style="text-align:left">contents</th></tr>
+<tr><td>heapmap.h</td><td class="w" style="text-align:left">page layouts (meta page with the state, model pages with sealed segments, exception pages), shared declarations</td></tr>
+<tr><td>hm_model.c</td><td class="w" style="text-align:left">evaluating the model, fitting segments, classifying rows as covered or exception</td></tr>
+<tr><td>hm_build.c</td><td class="w" style="text-align:left"><code>CREATE INDEX</code> / <code>REINDEX</code>; appending sealed segments</td></tr>
+<tr><td>hm_insert.c</td><td class="w" style="text-align:left">inserts, folding the tail into the model, the concurrent-writer rules, VACUUM</td></tr>
+<tr><td>hm_scan.c</td><td class="w" style="text-align:left">bitmap scans for equality and range predicates</td></tr>
+<tr><td>hm_exc.c</td><td class="w" style="text-align:left">the exception B+-tree</td></tr>
+<tr><td>hm_am.c</td><td class="w" style="text-align:left">access method handler, options, per-backend model cache, cost estimate, <code>heapmap_stats</code>, <code>heapmap_segments</code>, <code>heapmap_window</code></td></tr>
+<tr><td>test/, eval/, demo/</td><td class="w" style="text-align:left">correctness suite, experiment scripts with raw results, live demo</td></tr>
+</table>
+<p>
+Supported key types are <code>bigint</code>, <code>integer</code>, <code>timestamp</code>,
+<code>timestamptz</code> and <code>date</code>. The planner uses the index through its cost
+estimate like any other; <code>EXPLAIN</code> shows a Bitmap Index Scan on it. Three SQL functions
+expose the inside of an index: its statistics, the segments themselves, and the heap pages one
+lookup would read.
+</p>
+
+<h3>4.2 Concurrent writers</h3>
+<p>
+When several sessions insert at once, each fills a heap page of its own, and PostgreSQL grows a busy
+table by up to 64 pages at a time, handing those pages out in no particular order. Neighbouring keys
+therefore end up many pages apart, and a page that looks abandoned may simply not have had its turn.
+Our first version folded half-filled pages into the model and froze their windows; with 16 sessions,
+86% of rows ended up as exceptions and the index was as large as the B-tree. Three rules fixed it:
+</p>
+<ul>
+<li><b>The frontier only passes settled pages:</b> pages that are full, or that gained no row while
+plenty of rows arrived elsewhere. The index keeps a small stall list in its state page to tell.</li>
+<li><b>The newest segment stays open.</b> Rows for keys it already answers for keep turning up on later
+pages; its window widens to take them in as long as that costs lookups less than storing those rows
+exactly (a cost model with one knob, <code>exception_pct</code>). When new rows stop fitting its line,
+it is sealed and new segments are fitted.</li>
+<li><b>Stray rows cannot steer the model.</b> A window does not stretch for one or two rows, a new
+segment needs a real share of the rows to stand on, sparsely filled pages are ignored when fitting,
+and the tail's fence comes back down if a row with a key from the future pushed it up.</li>
+</ul>
+<p>
+The result is that lookup cost degrades gradually with the number of writers, following the
+scatter that is physically there, while the index stays small (section 5.2).
+</p>
+
+<h3>4.3 Correctness testing</h3>
+<p>
+<code>test/run_tests.sh</code> compares the exact set of rows the index returns with a sequential scan,
+for random equality and range predicates, on sixteen tables: sorted, jittered, 2% late rows, whole
+batches out of place, heavy duplicates, fully random, negative keys, NULLs, empty, one row, one
+repeated key, rows of very different lengths, and each key type. The checks are repeated after
+appends, late inserts, row-at-a-time inserts, updates that move rows and updates that do not,
+deletes, VACUUM, reuse of freed space and REINDEX; then with 16 concurrent clients inserting,
+reading and deleting; and finally after an immediate shutdown right after a bulk insert, to
+exercise WAL recovery. The suite passes on the submitted code.
+</p>
+
+<h2>5. Experiments</h2>
+<p class="small">
+PostgreSQL 18.7, Intel i7-13620H (16 threads), 16 GB RAM, NVMe SSD, Ubuntu 24.04, everything cached in
+memory. Each number is from one run on one machine: sizes and page counts are exact, timings are
+medians of alternating rounds and should be read as indicative. Raw output is in
+<code>contrib/heapmap/eval/results/</code> and every table below can be regenerated with the scripts in
+<code>contrib/heapmap/eval/</code>.
+</p>
+
+<h3>5.1 One writer: 10M rows, then 2M more (<code>eval/quick_compare.sh</code>)</h3>
+<p>Keys increase with a random gap, like event timestamps. Table: <code>(k bigint, payload int)</code>, 423 MB.</p>
+<table>
+<tr><th></th><th>btree</th><th>BRIN</th><th>BRIN, 8 pages/range</th><th>heapmap</th></tr>
+<tr><td>Index size</td><td>214 MB</td><td>32 kB</td><td>240 kB</td><td><b>24 kB</b></td></tr>
+<tr><td>Build time (one core)</td><td>2.18 s</td><td>0.78 s</td><td>0.79 s</td><td>0.86 s</td></tr>
+<tr><td>Pages read per point lookup</td><td>4</td><td>131</td><td>45</td><td>5</td></tr>
+<tr><td>Point lookup, in server</td><td>2.6 µs</td><td>537 µs</td><td>567 µs</td><td>15.9 µs</td></tr>
+<tr><td>Range query, about 10,000 rows</td><td>735 µs</td><td>1,250 µs</td><td>1,247 µs</td><td><b>594 µs</b></td></tr>
+<tr><td>Loading 2M more rows</td><td>2.24 s</td><td>1.02 s</td><td>0.94 s</td><td>1.23 s</td></tr>
+<tr><td>WAL written by that load</td><td>264 MB</td><td>139 MB</td><td>138 MB</td><td>138 MB</td></tr>
+<tr><td>Index size after the load</td><td>257 MB</td><td>32 kB</td><td>240 kB</td><td><b>24 kB</b></td></tr>
+</table>
+<p>
+Read plainly: the index is the size of BRIN and about 30 times faster than BRIN on point lookups.
+Against the B-tree it is several thousand times smaller, loads data about twice as fast with half the
+WAL, and is on par for range queries, but a cached point lookup is about six times slower, because
+it filters whole heap pages where the B-tree goes straight to the row. After the load the model has
+absorbed the new rows through folding and the index has not grown.
+</p>
+
+<h3>5.2 Many writers (<code>eval/concurrent.sh</code>)</h3>
+<p>Each session runs <code>INSERT INTO t VALUES (nextval('seq'))</code> for 8 seconds with
+<code>synchronous_commit</code> off. "Window" is the average number of heap pages a lookup reads.</p>
+<table>
+<tr><th>Sessions</th><th>Rows</th><th>Stored as exceptions</th><th>Window</th><th>heapmap</th><th>btree</th></tr>
+<tr><td>1</td><td>0.40M</td><td>0.00%</td><td>2</td><td>24 kB</td><td>8.8 MB</td></tr>
+<tr><td>2</td><td>0.69M</td><td>0.03%</td><td>4.5</td><td>24 kB</td><td>15 MB</td></tr>
+<tr><td>4</td><td>1.13M</td><td>0.04%</td><td>9</td><td>40 kB</td><td>24 MB</td></tr>
+<tr><td>8</td><td>1.81M</td><td>0.07%</td><td>21</td><td>96 kB</td><td>39 MB</td></tr>
+<tr><td>16</td><td>2.18M</td><td>1.15%</td><td>36</td><td>752 kB</td><td>47 MB</td></tr>
+<tr><td>32</td><td>2.17M</td><td>6.20%</td><td>47</td><td>2.9 MB</td><td>47 MB</td></tr>
+</table>
+<p>
+With a mix of single-row inserts, 300-row inserts, late rows, reads and deletes: 0.25% exceptions
+with 4 sessions (384 kB against a 92 MB btree) and 1.66% with 16 (1.3 MB against 58 MB). Before the
+rules of section 4.2, the 16-session run stored 86% of its rows as exceptions. The window grows
+because that is how far apart PostgreSQL really puts neighbouring keys; the index reports what the
+heap looks like rather than hiding it.
+</p>
+<figure>
+<img src="figures/concurrent.png" alt="concurrent writers">
+<figcaption><b>Figure 2.</b> Exceptions, window width and index size against the number of sessions inserting at once.</figcaption>
+</figure>
+
+<h3>5.3 A real event stream: one day of GitHub (<code>eval/gharchive.sh</code>)</h3>
+<p>
+Every public GitHub event of 1 January 2024 from GH Archive, 3,879,843 events, loaded in the order
+they were recorded and indexed on <code>created_at</code> (one-second resolution, 45 events per second).
+The stream is nearly but not perfectly ordered: 0.19% of events have a timestamp behind an earlier
+event, by up to 58 minutes. The first 95% are loaded and indexed; the last 5% are appended afterwards.
+</p>
+<table>
+<tr><th></th><th>btree</th><th>BRIN</th><th>heapmap</th></tr>
+<tr><td>Index size (table 342 MB)</td><td>25 MB</td><td>32 kB</td><td><b>136 kB</b></td></tr>
+<tr><td>Build time</td><td>0.91 s</td><td>0.35 s</td><td>0.74 s</td></tr>
+<tr><td>Pages read per "events at this second" (45 rows)</td><td>4.0</td><td>459.6</td><td>8.1</td></tr>
+<tr><td>Time per such lookup, cached</td><td>11 µs</td><td>1,867 µs</td><td>29 µs</td></tr>
+<tr><td>"Everything in a 5-minute window" (13,500 rows)</td><td>480 µs</td><td>3,142 µs</td><td>827 µs</td></tr>
+<tr><td>Appending the last 194k events</td><td>0.45 s, 46 MB WAL</td><td>0.37 s, 34 MB</td><td>0.40 s, 34 MB</td></tr>
+<tr><td>Index size after the append</td><td>27 MB</td><td>32 kB</td><td>176 kB</td></tr>
+</table>
+<p>
+The model has 261 segments with an average window of 5.3 pages, and 6,390 exception entries: 0.17% of
+the rows, which is the share of the stream that really is out of order. BRIN suffers from exactly
+those rows: one late event inside a 128-page range stretches that range's minimum, so a lookup
+matches several ranges and reads 460 pages. heapmap stores the late row exactly and keeps its
+window at five pages. After the append, the correctness check still finds the index and a sequential
+scan in agreement on every query.
+</p>
+
+<h3>5.4 Scaling with table size (<code>eval/scale.sh</code>)</h3>
+<table class="small">
+<tr><th>Rows</th><th>btree size</th><th>heapmap size</th><th>btree build</th><th>heapmap build</th><th>pages per lookup<br>btree / BRIN / heapmap</th><th>heapmap model</th></tr>
+<tr><td>1M</td><td>21 MB</td><td>24 kB</td><td>0.21 s</td><td>0.14 s</td><td>4 / 130 / 5</td><td>3 segments, 13 exceptions</td></tr>
+<tr><td>5M</td><td>107 MB</td><td>24 kB</td><td>0.91 s</td><td>0.46 s</td><td>4 / 130 / 5</td><td>19 segments, 96 exceptions</td></tr>
+<tr><td>20M</td><td>428 MB</td><td>24 kB</td><td>3.95 s</td><td>1.57 s</td><td>4 / 132 / 5</td><td>71 segments, 361 exceptions</td></tr>
+<tr><td>50M</td><td>1,071 MB</td><td>40 kB</td><td>8.76 s</td><td>3.87 s</td><td>5 / 140 / 6</td><td>179 segments, 935 exceptions</td></tr>
+</table>
+<p>
+The model grows with the number of distinct slopes in the data, not with the number of rows: a
+50M-row table with a steady arrival rate needs a few hundred segments. Build time is a single pass
+over the heap plus a sort of (key, page) pairs. Lookup cost is flat: 15 to 17 µs per cached point lookup from 1M to 50M rows.
+</p>
+<figure>
+<img src="figures/scale.png" alt="scaling">
+<figcaption><b>Figure 3.</b> Index size and pages read per lookup against table size, log scales.</figcaption>
+</figure>
+
+<h2>6. Limits and future work</h2>
+<ul>
+<li><b>Point lookups are slower than a B-tree when cached</b> (about 2 to 6 times), since a heap page
+is filtered instead of a row being addressed. From disk the picture would favour heapmap, as it
+reads fewer pages; we have not measured cold-cache behaviour.</li>
+<li><b>Very many writers.</b> The window grows with the number of sessions inserting at once and past
+<code>max_window</code> pages of scatter rows become exceptions (6% at 32 sessions on this machine).</li>
+<li><b>Bitmap scans only</b>, like BRIN: no ordered scans, unique constraints or index-only scans; one
+column per index.</li>
+<li><b>Space reused far from the end of the table</b> costs an exception per row: space freed by
+DELETE, short rows that fit into gaps in old pages (about 1% in our variable-length test table and in
+the GitHub append), and a session that pauses mid-page and resumes after the frontier passed it.
+The index suits append-mostly tables, which is also what BRIN is for.</li>
+<li><b><code>CREATE INDEX</code></b> holds one 16-byte record per row in memory while fitting.</li>
+<li><b>The planner</b> estimates bitmap heap scans as if rows were scattered, so it gives up on this
+index (and on BRIN) for wide ranges sooner than it should. Natural next steps: a cost estimate that
+knows the pages are consecutive, multi-column keys, and a cold-cache study.</li>
+</ul>
+
+<h2>7. Running it and the demo</h2>
+<pre>cd contrib/heapmap
+./cluster.sh init && ./cluster.sh install   # private PostgreSQL 18 cluster, port 5545, no sudo
+demo/demo.sh                                # live walk-through vs btree and BRIN, 3 minutes
+demo/demo_real.sh                           # one day of real GitHub events
+test/run_tests.sh                           # correctness suite
+eval/quick_compare.sh  eval/concurrent.sh  eval/gharchive.sh  eval/scale.sh</pre>
+<p>
+Or into an existing PostgreSQL 18: <code>make USE_PGXS=1 && sudo make USE_PGXS=1 install</code>, then
+<code>CREATE EXTENSION heapmap</code>. The demo builds the same 5M-row event table three times, one
+index each, and measures everything in front of the audience: build time, sizes, pages read per
+lookup, a range query, loading more rows, late rows and an update, eight sessions inserting at once
+with the index sizes sampled every two seconds, and a check that the index and a sequential scan
+return the same rows.
+</p>
+
+<h2>8. Related work and what is new here</h2>
+<p>
+Kraska et al. (2018) proposed replacing B-tree internals with learned models over a sorted array;
+ALEX (2020) and the PGM-index (2020) made such models updatable, still over their own arrays in
+memory. BRIN in PostgreSQL and zone maps in Netezza, Oracle and others summarise blocks with
+minimum and maximum values. heapmap combines the two views: it is a block-range index whose
+summary is a learned model of position, it indexes the heap in place rather than a copy of the keys,
+and it handles the parts those papers leave out of a real engine: a tail for in-order inserts
+that costs nothing, an exact exception store that bounds the damage of any row, folding that keeps
+the model current without rebuilding, and rules that keep a model honest when many sessions write
+to the same table. Every piece was tested against PostgreSQL's own sequential scan.
+</p>
+<p class="small">
+<b>Use of AI.</b> The design and the code were developed together with Claude (Anthropic) as a pair
+programmer; every design decision above was driven by measurements on this machine, and every
+claim in this report was produced by the scripts in the repository.
+</p>
+
+</body>
+</html>
