@@ -1,0 +1,38 @@
+PostgreSQL 18.6, i7-13620H, everything cached. eval/quick_compare.sh 10000000
+
+== loading 10000000 rows (keys increase with a varying gap, like event timestamps)
+== index build time (seconds, median of 3, one core)
+btree: 2.179727789
+brin: .782972405
+brin8: .789829091
+heapmap: .864145656
+== index size
+btree: 214 MB  (224641024 bytes)
+brin: 32 kB  (32768 bytes)
+brin8: 240 kB  (245760 bytes)
+heapmap: 24 kB  (24576 bytes)
+table: 423 MB
+heapmap model: 39 segments, window avg 3.00 max 3, 171 exceptions
+== pages touched by one point lookup (index + table), averaged over 300 keys
+btree: total 4.00 pages, of which index 0.00 (plan: Index Scan)
+brin: total 131.04 pages, of which index 3.04 (plan: Bitmap Heap Scan)
+brin8: total 45.04 pages, of which index 37.04 (plan: Bitmap Heap Scan)
+heapmap: total 4.99 pages, of which index 2.00 (plan: Bitmap Heap Scan)
+== warm point lookup inside the server (microseconds, median of 5 alternating rounds)
+btree: 2.634
+brin: 537.190
+brin8: 567.442
+heapmap: 15.919
+== range query returning about 10,000 rows (microseconds, median of 5)
+btree: 734.6
+brin: 1250.1
+brin8: 1247.0
+heapmap: 593.5
+== loading 2000000 more rows in order (seconds, and WAL written)
+btree: 2.243374806 s, WAL 264 MB, index now 257 MB
+brin: 1.017243886 s, WAL 139 MB, index now 32 kB
+brin8: .944259973 s, WAL 138 MB, index now 240 kB
+heapmap: 1.225723977 s, WAL 138 MB, index now 24 kB
+heapmap after load: 96 segments, window avg 3.00, tail 8 pages, 213 exceptions, 901 folds
+== heapmap still agrees with a table scan
+c_heapmap: ok (10 rounds)

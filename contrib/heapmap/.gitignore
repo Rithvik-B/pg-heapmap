@@ -1,6 +1,6 @@
 *.o
 *.so
 *.bc
-results/
-log/
-tmp_check/
+/results/
+/log/
+/tmp_check/
